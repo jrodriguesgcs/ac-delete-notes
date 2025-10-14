@@ -22,17 +22,26 @@ LOG_FILE = 'deletion_log.txt'
 
 def load_state():
     """Load progress state from file"""
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {
+    default_state = {
         'processed_note_ids': [],
         'total_deleted': 0,
         'total_failed': 0,
         'batch_number': 1,
         'start_time': datetime.now().isoformat(),
-        'last_run_time': None
+        'last_run_time': None,
+        'remaining_notes': 0
     }
+    
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            loaded_state = json.load(f)
+            # Merge with defaults to handle missing keys
+            for key, value in default_state.items():
+                if key not in loaded_state:
+                    loaded_state[key] = value
+            return loaded_state
+    
+    return default_state
 
 def save_state(state):
     """Save progress state to file"""
