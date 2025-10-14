@@ -1,0 +1,96 @@
+name: Delete ActiveCampaign Deal Notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_number:
+        description: 'Batch number (for tracking progress across runs)'
+        required: false
+        default: '1'
+      notes_per_run:
+        description: 'Maximum notes to delete in this run (0 = unlimited)'
+        required: false
+        default: '0'
+  schedule:
+    # Run every 5 hours and 50 minutes (just under the 6-hour limit)
+    - cron: '0 */6 * * *'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  delete-notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # 5 hours 50 minutes (safety margin before 6-hour limit)
+    
+    steps:
+      - name: 🚀 Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp requests
+      
+      - name: 📊 Load Progress State
+        id: load_state
+        run: |
+          # Download state from artifacts if exists
+          if [ -f progress_state.json ]; then
+            echo "STATE_EXISTS=true" >> $GITHUB_OUTPUT
+            cat progress_state.json
+          else
+            echo "STATE_EXISTS=false" >> $GITHUB_OUTPUT
+            echo '{"processed_note_ids": [], "total_deleted": 0, "batch_number": 1}' > progress_state.json
+          fi
+      
+      - name: 🗑️ Delete Notes (Batch Processing)
+        env:
+          ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
+          BASE_URL: 'https://globalcitizensolutions89584.api-us1.com/api/3'
+          TARGET_USER_ID: '112'
+          RATE_LIMIT: '10'
+          MAX_WORKERS: '20'
+          NOTES_PER_RUN: ${{ github.event.inputs.notes_per_run || '0' }}
+          BATCH_NUMBER: ${{ github.event.inputs.batch_number || '1' }}
+        run: python delete_notes.py
+      
+      - name: 💾 Save Progress State
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: progress-state-batch-${{ github.run_number }}
+          path: |
+            progress_state.json
+            deletion_log.txt
+          retention-days: 30
+      
+      - name: 📧 Send Progress Notification
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "ActiveCampaign Deletion Progress - Batch ${{ github.run_number }}"
+          body: file://deletion_log.txt
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: GitHub Actions
+        continue-on-error: true
+      
+      - name: 🔄 Trigger Next Run (if not complete)
+        if: success()
+        run: |
+          # Check if there are more notes to delete
+          REMAINING=$(cat progress_state.json | grep -o '"remaining_notes":[0-9]*' | grep -o '[0-9]*')
+          if [ "$REMAINING" -gt 0 ]; then
+            echo "✅ More notes remaining. Next run will be triggered by schedule."
+          else
+            echo "🎉 ALL NOTES DELETED! No more runs needed."
+          fi
