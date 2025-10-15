@@ -58,7 +58,12 @@ jobs:
           MAX_WORKERS: '20'
           NOTES_PER_RUN: ${{ github.event.inputs.notes_per_run || '0' }}
           BATCH_NUMBER: ${{ github.event.inputs.batch_number || '1' }}
-        run: python delete_notes.py
+        run: |
+          # Optional: Remove old progress state for fresh start
+          # Uncomment the next line if you want to start from scratch
+          # rm -f progress_state.json
+          
+          python delete_notes.py
       
       - name: 💾 Save Progress State
         if: always()
