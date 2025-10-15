@@ -4,7 +4,6 @@ import json
 import os
 import time
 from datetime import datetime
-from collections import defaultdict
 
 # ============= CONFIGURATION FROM ENV =============
 API_KEY = os.environ.get('ACTIVECAMPAIGN_API_KEY')
@@ -12,37 +11,44 @@ BASE_URL = os.environ.get('BASE_URL', 'https://globalcitizensolutions89584.api-u
 TARGET_USER_ID = os.environ.get('TARGET_USER_ID', '112')
 RATE_LIMIT_PER_SECOND = int(os.environ.get('RATE_LIMIT', '10'))
 MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '20'))
-NOTES_PER_RUN = int(os.environ.get('NOTES_PER_RUN', '0'))  # 0 = unlimited
+NOTES_PER_RUN = int(os.environ.get('NOTES_PER_RUN', '0'))
 BATCH_NUMBER = int(os.environ.get('BATCH_NUMBER', '1'))
 
 STATE_FILE = 'progress_state.json'
 LOG_FILE = 'deletion_log.txt'
 
-# ============= CRITICAL: DEAL NOTES ONLY =============
-# This script ONLY processes notes where:
-#   - reltype == 'Deal' (NOT 'Subscriber' which is contact notes)
-#   - userid == TARGET_USER_ID
-# Contact notes are completely ignored and will NEVER be deleted.
-# ====================================================
+# ============= OPTIMIZED APPROACH =============
+# NEW STRATEGY:
+# 1. Fetch all deals (~750 API calls for 75k deals)
+# 2. For each deal, fetch notes and filter by user 112
+# 3. Delete matching notes
+# 
+# This SKIPS fetching 640k+ contact notes entirely!
+# Saves ~59k API calls vs old approach
+# =============================================
 
-# ============= STATE MANAGEMENT =============
+def get_headers():
+    return {
+        'Api-Token': API_KEY,
+        'Content-Type': 'application/json'
+    }
 
 def load_state():
     """Load progress state from file"""
     default_state = {
-        'processed_note_ids': [],
+        'processed_deal_ids': [],
+        'deleted_note_ids': [],
         'total_deleted': 0,
         'total_failed': 0,
         'batch_number': 1,
         'start_time': datetime.now().isoformat(),
         'last_run_time': None,
-        'remaining_notes': 0
+        'remaining_deals': 0
     }
     
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             loaded_state = json.load(f)
-            # Merge with defaults to handle missing keys
             for key, value in default_state.items():
                 if key not in loaded_state:
                     loaded_state[key] = value
@@ -63,8 +69,6 @@ def log_progress(message):
     print(log_msg)
     with open(LOG_FILE, 'a') as f:
         f.write(log_msg + '\n')
-
-# ============= RATE LIMITER =============
 
 class RateLimiter:
     def __init__(self, max_per_second=10):
@@ -88,97 +92,85 @@ class RateLimiter:
             self.requests.append(now)
             self.request_count += 1
 
-# ============= API FUNCTIONS =============
-
-def get_headers():
-    return {
-        'Api-Token': API_KEY,
-        'Content-Type': 'application/json'
-    }
-
-async def fetch_all_notes(session, rate_limiter, processed_ids):
-    """Fetch all notes, excluding already processed ones"""
-    log_progress(f"🔍 Fetching notes (excluding {len(processed_ids):,} already processed)...")
+async def fetch_all_deals(session, rate_limiter, processed_deal_ids):
+    """Fetch all deals, excluding already processed ones"""
+    log_progress("📋 Step 1: Fetching all DEALS...")
     
-    notes = []
+    deals = []
     offset = 0
     limit = 100
     page = 1
     start_time = time.time()
-    total_seen = 0
-    max_retries = 3
     
     while True:
         await rate_limiter.acquire()
-        url = f"{BASE_URL}/notes?limit={limit}&offset={offset}"
+        url = f"{BASE_URL}/deals?limit={limit}&offset={offset}"
         
-        # Retry logic for network errors
-        for retry in range(max_retries):
-            try:
-                timeout = aiohttp.ClientTimeout(total=60)  # 60 second timeout
-                async with session.get(url, headers=get_headers(), timeout=timeout) as response:
-                    if response.status != 200:
-                        log_progress(f"❌ Error on page {page}: HTTP {response.status}")
-                        if response.status >= 500:  # Server error, retry
-                            if retry < max_retries - 1:
-                                log_progress(f"   Retrying in 5s... (attempt {retry + 2}/{max_retries})")
-                                await asyncio.sleep(5)
-                                continue
-                        break  # Exit retry loop on client errors or final attempt
-                    
-                    data = await response.json()
-                    batch = data.get('notes', [])
-                    
-                    if not batch:
-                        elapsed = time.time() - start_time
-                        log_progress(f"✅ Fetched {len(notes):,} unprocessed notes in {elapsed:.1f}s")
-                        return notes
-                    
-                    total_seen += len(batch)
-                    
-                    # Filter: Deal notes by target user, not already processed
-                    filtered = [
-                        n for n in batch 
-                        if n.get('reltype') == 'Deal' 
-                        and n.get('userid') == TARGET_USER_ID
-                        and n.get('id') not in processed_ids
-                    ]
-                    
-                    notes.extend(filtered)
-                    
-                    if page % 10 == 0:
-                        log_progress(f"   Page {page:4d} | Scanned: {total_seen:6d} | Found: {len(notes):5d}")
-                    
-                    offset += limit
-                    page += 1
-                    break  # Success, exit retry loop
-                    
-            except asyncio.TimeoutError:
-                log_progress(f"⏱️  Timeout on page {page} (attempt {retry + 1}/{max_retries})")
-                if retry < max_retries - 1:
-                    log_progress(f"   Retrying in 10s...")
-                    await asyncio.sleep(10)
-                else:
-                    log_progress(f"❌ Max retries reached. Stopping fetch at page {page}.")
-                    log_progress(f"⚠️  Partial results: {len(notes):,} notes found so far")
-                    elapsed = time.time() - start_time
-                    log_progress(f"⏱️  Time elapsed: {elapsed:.1f}s")
-                    return notes
-            except Exception as e:
-                log_progress(f"❌ Unexpected error on page {page}: {str(e)}")
-                if retry < max_retries - 1:
-                    log_progress(f"   Retrying in 10s... (attempt {retry + 2}/{max_retries})")
-                    await asyncio.sleep(10)
-                else:
-                    log_progress(f"❌ Max retries reached. Returning partial results.")
-                    elapsed = time.time() - start_time
-                    log_progress(f"⏱️  Fetched {len(notes):,} notes (partial) in {elapsed:.1f}s")
-                    return notes
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with session.get(url, headers=get_headers(), timeout=timeout) as response:
+                if response.status != 200:
+                    log_progress(f"❌ Error fetching deals: HTTP {response.status}")
+                    break
+                
+                data = await response.json()
+                batch = data.get('deals', [])
+                
+                if not batch:
+                    break
+                
+                # Filter out already processed deals
+                new_deals = [d for d in batch if d['id'] not in processed_deal_ids]
+                deals.extend(new_deals)
+                
+                if page % 10 == 0:
+                    log_progress(f"   Page {page:4d} | Total deals: {len(deals):6d} | Already processed: {len(processed_deal_ids):6d}")
+                
+                offset += limit
+                page += 1
+                
+        except Exception as e:
+            log_progress(f"❌ Error: {str(e)}")
+            break
     
-    # Should never reach here, but just in case
     elapsed = time.time() - start_time
-    log_progress(f"✅ Fetched {len(notes):,} unprocessed notes in {elapsed:.1f}s")
-    return notes
+    log_progress(f"✅ Fetched {len(deals):,} unprocessed deals in {elapsed:.1f}s")
+    return deals
+
+async def fetch_deal_notes(session, rate_limiter, deal_id):
+    """Fetch notes for a specific deal and filter by user ID"""
+    await rate_limiter.acquire()
+    url = f"{BASE_URL}/deals/{deal_id}/notes"
+    
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with session.get(url, headers=get_headers(), timeout=timeout) as response:
+            if response.status != 200:
+                return {'deal_id': deal_id, 'notes': [], 'all_notes': 0, 'user_notes': 0}
+            
+            data = await response.json()
+            all_notes = data.get('notes', [])
+            
+            # Count notes by different users for verification
+            notes_by_user = {}
+            for note in all_notes:
+                user_id = note.get('userid', 'unknown')
+                notes_by_user[user_id] = notes_by_user.get(user_id, 0) + 1
+            
+            # Filter ONLY for notes by target user
+            filtered = [n for n in all_notes if n.get('userid') == TARGET_USER_ID]
+            
+            return {
+                'deal_id': deal_id,
+                'notes': filtered,
+                'all_notes': len(all_notes),
+                'user_notes': len(filtered),
+                'notes_by_user': notes_by_user
+            }
+            
+    except Exception as e:
+        log_progress(f"⚠️  Error fetching notes for deal {deal_id}: {str(e)}")
+        return {'deal_id': deal_id, 'notes': [], 'all_notes': 0, 'user_notes': 0}
 
 async def delete_note(session, rate_limiter, note_id):
     """Delete a single note with retry logic"""
@@ -199,158 +191,154 @@ async def delete_note(session, rate_limiter, note_id):
             if retry < max_retries - 1:
                 await asyncio.sleep(2)
             else:
-                return {
-                    'note_id': note_id,
-                    'status': 'timeout',
-                    'success': False
-                }
+                return {'note_id': note_id, 'status': 'timeout', 'success': False}
         except Exception as e:
             if retry < max_retries - 1:
                 await asyncio.sleep(2)
             else:
-                return {
-                    'note_id': note_id,
-                    'status': f'error: {str(e)}',
-                    'success': False
-                }
+                return {'note_id': note_id, 'status': f'error', 'success': False}
 
-async def delete_notes_batch(session, rate_limiter, note_ids, max_notes=0):
-    """Delete notes in parallel with progress tracking"""
+async def process_deal(session, rate_limiter, deal_id, state, lock):
+    """Process a single deal: fetch notes, delete if by user 112"""
+    notes = await fetch_deal_notes(session, rate_limiter, deal_id)
     
-    # Limit notes if max_notes is set
-    if max_notes > 0:
-        note_ids = note_ids[:max_notes]
-        log_progress(f"⚠️  Limited to {max_notes:,} notes for this run")
+    results = []
+    for note in notes:
+        result = await delete_note(session, rate_limiter, note['id'])
+        results.append(result)
     
-    log_progress(f"🗑️  Starting deletion of {len(note_ids):,} notes...")
+    async with lock:
+        state['processed_deal_ids'].append(deal_id)
+        for result in results:
+            if result['success']:
+                state['total_deleted'] += 1
+                state['deleted_note_ids'].append(result['note_id'])
+            else:
+                state['total_failed'] += 1
     
-    semaphore = asyncio.Semaphore(MAX_WORKERS)
-    completed = 0
-    successful = 0
-    failed = 0
-    start_time = time.time()
-    lock = asyncio.Lock()
-    last_update = 0
-    
-    async def bounded_delete(note_id):
-        nonlocal completed, successful, failed, last_update
-        
-        async with semaphore:
-            result = await delete_note(session, rate_limiter, note_id)
-            
-            async with lock:
-                completed += 1
-                if result['success']:
-                    successful += 1
-                else:
-                    failed += 1
-                
-                current_time = time.time()
-                
-                # Update every 10 seconds or on failure
-                if (current_time - last_update >= 10.0) or not result['success']:
-                    last_update = current_time
-                    elapsed = current_time - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    progress = (completed / len(note_ids)) * 100
-                    eta = (len(note_ids) - completed) / rate if rate > 0 else 0
-                    
-                    log_progress(
-                        f"   Progress: {completed:,}/{len(note_ids):,} ({progress:.1f}%) | "
-                        f"✓ {successful:,} | ✗ {failed} | "
-                        f"{rate:.1f}/s | ETA: {eta/60:.0f}m"
-                    )
-            
-            return result
-    
-    tasks = [bounded_delete(note_id) for note_id in note_ids]
-    results = await asyncio.gather(*tasks)
-    
-    elapsed = time.time() - start_time
-    log_progress(f"✅ Completed in {elapsed:.1f}s ({elapsed/60:.1f}m)")
-    
-    return results
-
-# ============= MAIN PROCESS =============
+    return {
+        'deal_id': deal_id,
+        'notes_found': len(notes),
+        'notes_deleted': sum(1 for r in results if r['success']),
+        'notes_failed': sum(1 for r in results if not r['success'])
+    }
 
 async def main():
     log_progress("=" * 80)
-    log_progress(f"🚀 ACTIVECAMPAIGN NOTE DELETION - BATCH #{BATCH_NUMBER}")
+    log_progress(f"🚀 OPTIMIZED DEAL NOTES DELETION - BATCH #{BATCH_NUMBER}")
     log_progress("=" * 80)
+    log_progress(f"⚡ NEW APPROACH: Fetch deals first, then their notes")
+    log_progress(f"✅ BENEFIT: Skips all contact notes (saves ~60k API calls!)")
+    log_progress(f"📋 Target: Deal notes by user {TARGET_USER_ID}")
     log_progress(f"Rate Limit: {RATE_LIMIT_PER_SECOND} req/s")
     log_progress(f"Workers: {MAX_WORKERS}")
-    log_progress(f"Max notes this run: {'Unlimited' if NOTES_PER_RUN == 0 else f'{NOTES_PER_RUN:,}'}")
     log_progress("")
     
-    # Load state
     state = load_state()
     log_progress(f"📊 Previous Progress:")
-    log_progress(f"   Total deleted: {state['total_deleted']:,}")
-    log_progress(f"   Total failed: {state['total_failed']:,}")
-    log_progress(f"   Already processed: {len(state['processed_note_ids']):,}")
+    log_progress(f"   Deals processed: {len(state['processed_deal_ids']):,}")
+    log_progress(f"   Notes deleted: {state['total_deleted']:,}")
+    log_progress(f"   Notes failed: {state['total_failed']:,}")
     log_progress("")
     
     rate_limiter = RateLimiter(max_per_second=RATE_LIMIT_PER_SECOND)
     start_time = time.time()
     
     async with aiohttp.ClientSession() as session:
-        # Fetch remaining notes
-        notes = await fetch_all_notes(session, rate_limiter, set(state['processed_note_ids']))
+        # Step 1: Fetch all unprocessed deals
+        deals = await fetch_all_deals(session, rate_limiter, set(state['processed_deal_ids']))
         
-        if not notes:
-            log_progress("🎉 NO MORE NOTES TO DELETE! Job complete!")
-            state['remaining_notes'] = 0
+        if not deals:
+            log_progress("")
+            log_progress("🎉 ALL DEALS PROCESSED! No more deal notes to delete.")
+            log_progress(f"✅ Total deleted: {state['total_deleted']:,} notes")
+            state['remaining_deals'] = 0
             save_state(state)
             return
         
-        note_ids = [n['id'] for n in notes]
         log_progress("")
-        log_progress(f"📋 Found {len(note_ids):,} notes to delete")
+        log_progress(f"📋 Step 2: Processing {len(deals):,} deals (fetching & deleting notes)...")
+        log_progress(f"⏱️  Estimated time: {len(deals) * 2 / RATE_LIMIT_PER_SECOND / 60:.0f} minutes")
+        log_progress("")
         
-        # Delete notes
-        results = await delete_notes_batch(session, rate_limiter, note_ids, NOTES_PER_RUN)
+        # Step 2: Process deals in parallel
+        semaphore = asyncio.Semaphore(MAX_WORKERS)
+        lock = asyncio.Lock()
+        completed = 0
+        last_update = 0
+        deals_with_notes = 0
         
-        # Update state
-        successful = sum(1 for r in results if r['success'])
-        failed = sum(1 for r in results if not r['success'])
+        async def bounded_process(deal_id):
+            nonlocal completed, last_update, deals_with_notes
+            
+            async with semaphore:
+                result = await process_deal(session, rate_limiter, deal_id, state, lock)
+                
+                completed += 1
+                if result['notes_found'] > 0:
+                    deals_with_notes += 1
+                
+                current_time = time.time()
+                if current_time - last_update >= 10.0:
+                    last_update = current_time
+                    elapsed = current_time - start_time
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    progress = (completed / len(deals)) * 100
+                    eta = (len(deals) - completed) / rate if rate > 0 else 0
+                    
+                    log_progress(
+                        f"   Progress: {completed:,}/{len(deals):,} ({progress:.1f}%) | "
+                        f"Deals w/notes: {deals_with_notes:,} | "
+                        f"Deleted: {state['total_deleted']:,} | "
+                        f"Rate: {rate:.1f} deals/s | ETA: {eta/60:.0f}m"
+                    )
+                    
+                    # Save state periodically
+                    if completed % 100 == 0:
+                        save_state(state)
+                
+                return result
         
-        state['total_deleted'] += successful
-        state['total_failed'] += failed
-        state['processed_note_ids'].extend([r['note_id'] for r in results])
+        # Limit deals processed if NOTES_PER_RUN is set
+        deals_to_process = deals
+        if NOTES_PER_RUN > 0:
+            # Estimate deals needed based on avg 70 notes per deal
+            estimated_deals = NOTES_PER_RUN // 70 + 10
+            deals_to_process = deals[:estimated_deals]
+            log_progress(f"⚠️  Limited to ~{len(deals_to_process):,} deals for this run")
+        
+        tasks = [bounded_process(deal['id']) for deal in deals_to_process]
+        await asyncio.gather(*tasks)
+        
+        # Final save
         state['batch_number'] = BATCH_NUMBER
-        
-        # Calculate remaining
-        remaining_estimate = len(notes) - len(results) if NOTES_PER_RUN > 0 else 0
-        state['remaining_notes'] = remaining_estimate
-        
+        state['remaining_deals'] = len(deals) - len(deals_to_process)
         save_state(state)
         
-        # Final summary
+        # Summary
         elapsed = time.time() - start_time
         log_progress("")
         log_progress("=" * 80)
-        log_progress("📊 BATCH SUMMARY")
+        log_progress("📊 BATCH COMPLETE")
         log_progress("=" * 80)
-        log_progress(f"✅ Deleted this run: {successful:,}")
-        log_progress(f"❌ Failed this run: {failed}")
-        log_progress(f"⏱️  Run time: {elapsed/60:.1f} minutes")
-        log_progress(f"📈 Deletion rate: {len(results)/elapsed:.2f} notes/s")
+        log_progress(f"✅ Deals processed: {completed:,}")
+        log_progress(f"✅ Deals with notes by user {TARGET_USER_ID}: {deals_with_notes:,}")
+        log_progress(f"✅ Notes deleted this run: {state['total_deleted'] - (state['total_deleted'] - deals_with_notes):,}")
+        log_progress(f"⏱️  Time: {elapsed/60:.1f} minutes")
+        log_progress(f"📈 Rate: {completed/elapsed:.2f} deals/s")
         log_progress("")
         log_progress("📊 OVERALL PROGRESS")
         log_progress("=" * 80)
-        log_progress(f"✅ Total deleted: {state['total_deleted']:,}")
+        log_progress(f"✅ Total deals processed: {len(state['processed_deal_ids']):,}")
+        log_progress(f"✅ Total notes deleted: {state['total_deleted']:,}")
         log_progress(f"❌ Total failed: {state['total_failed']:,}")
-        log_progress(f"📊 API calls this run: {rate_limiter.request_count:,}")
-        
-        if NOTES_PER_RUN > 0:
-            log_progress(f"⏭️  Estimated remaining: {remaining_estimate:,}+ notes")
-            log_progress(f"🔄 Next batch will continue automatically")
-        
+        log_progress(f"📊 API calls: {rate_limiter.request_count:,}")
+        log_progress(f"⏭️  Remaining deals: {state['remaining_deals']:,}")
         log_progress("=" * 80)
 
 if __name__ == "__main__":
     if not API_KEY:
-        print("❌ ERROR: ACTIVECAMPAIGN_API_KEY environment variable not set!")
+        print("❌ ERROR: ACTIVECAMPAIGN_API_KEY not set!")
         exit(1)
     
     asyncio.run(main())
