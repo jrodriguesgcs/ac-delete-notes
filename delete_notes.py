@@ -18,6 +18,13 @@ BATCH_NUMBER = int(os.environ.get('BATCH_NUMBER', '1'))
 STATE_FILE = 'progress_state.json'
 LOG_FILE = 'deletion_log.txt'
 
+# ============= CRITICAL: DEAL NOTES ONLY =============
+# This script ONLY processes notes where:
+#   - reltype == 'Deal' (NOT 'Subscriber' which is contact notes)
+#   - userid == TARGET_USER_ID
+# Contact notes are completely ignored and will NEVER be deleted.
+# ====================================================
+
 # ============= STATE MANAGEMENT =============
 
 def load_state():
@@ -99,55 +106,113 @@ async def fetch_all_notes(session, rate_limiter, processed_ids):
     page = 1
     start_time = time.time()
     total_seen = 0
+    max_retries = 3
     
     while True:
         await rate_limiter.acquire()
         url = f"{BASE_URL}/notes?limit={limit}&offset={offset}"
         
-        async with session.get(url, headers=get_headers()) as response:
-            if response.status != 200:
-                log_progress(f"❌ Error on page {page}: HTTP {response.status}")
-                break
-            
-            data = await response.json()
-            batch = data.get('notes', [])
-            
-            if not batch:
-                break
-            
-            total_seen += len(batch)
-            
-            # Filter: Deal notes by target user, not already processed
-            filtered = [
-                n for n in batch 
-                if n.get('reltype') == 'Deal' 
-                and n.get('userid') == TARGET_USER_ID
-                and n.get('id') not in processed_ids
-            ]
-            
-            notes.extend(filtered)
-            
-            if page % 10 == 0:
-                log_progress(f"   Page {page:4d} | Scanned: {total_seen:6d} | Found: {len(notes):5d}")
-            
-            offset += limit
-            page += 1
+        # Retry logic for network errors
+        for retry in range(max_retries):
+            try:
+                timeout = aiohttp.ClientTimeout(total=60)  # 60 second timeout
+                async with session.get(url, headers=get_headers(), timeout=timeout) as response:
+                    if response.status != 200:
+                        log_progress(f"❌ Error on page {page}: HTTP {response.status}")
+                        if response.status >= 500:  # Server error, retry
+                            if retry < max_retries - 1:
+                                log_progress(f"   Retrying in 5s... (attempt {retry + 2}/{max_retries})")
+                                await asyncio.sleep(5)
+                                continue
+                        break  # Exit retry loop on client errors or final attempt
+                    
+                    data = await response.json()
+                    batch = data.get('notes', [])
+                    
+                    if not batch:
+                        elapsed = time.time() - start_time
+                        log_progress(f"✅ Fetched {len(notes):,} unprocessed notes in {elapsed:.1f}s")
+                        return notes
+                    
+                    total_seen += len(batch)
+                    
+                    # Filter: Deal notes by target user, not already processed
+                    filtered = [
+                        n for n in batch 
+                        if n.get('reltype') == 'Deal' 
+                        and n.get('userid') == TARGET_USER_ID
+                        and n.get('id') not in processed_ids
+                    ]
+                    
+                    notes.extend(filtered)
+                    
+                    if page % 10 == 0:
+                        log_progress(f"   Page {page:4d} | Scanned: {total_seen:6d} | Found: {len(notes):5d}")
+                    
+                    offset += limit
+                    page += 1
+                    break  # Success, exit retry loop
+                    
+            except asyncio.TimeoutError:
+                log_progress(f"⏱️  Timeout on page {page} (attempt {retry + 1}/{max_retries})")
+                if retry < max_retries - 1:
+                    log_progress(f"   Retrying in 10s...")
+                    await asyncio.sleep(10)
+                else:
+                    log_progress(f"❌ Max retries reached. Stopping fetch at page {page}.")
+                    log_progress(f"⚠️  Partial results: {len(notes):,} notes found so far")
+                    elapsed = time.time() - start_time
+                    log_progress(f"⏱️  Time elapsed: {elapsed:.1f}s")
+                    return notes
+            except Exception as e:
+                log_progress(f"❌ Unexpected error on page {page}: {str(e)}")
+                if retry < max_retries - 1:
+                    log_progress(f"   Retrying in 10s... (attempt {retry + 2}/{max_retries})")
+                    await asyncio.sleep(10)
+                else:
+                    log_progress(f"❌ Max retries reached. Returning partial results.")
+                    elapsed = time.time() - start_time
+                    log_progress(f"⏱️  Fetched {len(notes):,} notes (partial) in {elapsed:.1f}s")
+                    return notes
     
+    # Should never reach here, but just in case
     elapsed = time.time() - start_time
     log_progress(f"✅ Fetched {len(notes):,} unprocessed notes in {elapsed:.1f}s")
     return notes
 
 async def delete_note(session, rate_limiter, note_id):
-    """Delete a single note"""
+    """Delete a single note with retry logic"""
     await rate_limiter.acquire()
     url = f"{BASE_URL}/notes/{note_id}"
     
-    async with session.delete(url, headers=get_headers()) as response:
-        return {
-            'note_id': note_id,
-            'status': response.status,
-            'success': response.status == 200
-        }
+    max_retries = 3
+    for retry in range(max_retries):
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with session.delete(url, headers=get_headers(), timeout=timeout) as response:
+                return {
+                    'note_id': note_id,
+                    'status': response.status,
+                    'success': response.status == 200
+                }
+        except asyncio.TimeoutError:
+            if retry < max_retries - 1:
+                await asyncio.sleep(2)
+            else:
+                return {
+                    'note_id': note_id,
+                    'status': 'timeout',
+                    'success': False
+                }
+        except Exception as e:
+            if retry < max_retries - 1:
+                await asyncio.sleep(2)
+            else:
+                return {
+                    'note_id': note_id,
+                    'status': f'error: {str(e)}',
+                    'success': False
+                }
 
 async def delete_notes_batch(session, rate_limiter, note_ids, max_notes=0):
     """Delete notes in parallel with progress tracking"""
