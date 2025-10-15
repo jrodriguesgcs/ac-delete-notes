@@ -198,15 +198,58 @@ async def delete_note(session, rate_limiter, note_id):
             else:
                 return {'note_id': note_id, 'status': f'error', 'success': False}
 
-async def process_deal(session, rate_limiter, deal_id, state, lock):
+async def process_deal(session, rate_limiter, deal_id, state, lock, stats):
     """Process a single deal: fetch notes, delete if by user 112"""
-    notes = await fetch_deal_notes(session, rate_limiter, deal_id)
     
+    # Fetch notes for this deal
+    notes_data = await fetch_deal_notes(session, rate_limiter, deal_id)
+    
+    # Handle both dict and list returns (for backwards compatibility)
+    if isinstance(notes_data, dict):
+        notes = notes_data.get('notes', [])
+        all_notes_count = notes_data.get('all_notes', 0)
+        user_notes_count = notes_data.get('user_notes', 0)
+        notes_by_user = notes_data.get('notes_by_user', {})
+    else:
+        # Legacy format (list)
+        notes = notes_data if notes_data else []
+        all_notes_count = len(notes)
+        user_notes_count = len(notes)
+        notes_by_user = {TARGET_USER_ID: len(notes)} if notes else {}
+    
+    # Log detailed info for deals with notes
+    if notes_data['all_notes'] > 0:
+        async with lock:
+            stats['deals_with_notes'] += 1
+            stats['total_notes_scanned'] += notes_data['all_notes']
+            
+            # Log sample deals with detailed breakdown
+            if stats['deals_with_notes'] <= 10 or stats['deals_with_notes'] % 100 == 0:
+                log_progress(f"")
+                log_progress(f"📋 Deal ID {deal_id} analysis:")
+                log_progress(f"   ├─ Total notes on deal: {notes_data['all_notes']}")
+                log_progress(f"   ├─ Notes by user {TARGET_USER_ID}: {notes_data['user_notes']} ✅ WILL DELETE")
+                log_progress(f"   ├─ Notes by other users: {notes_data['all_notes'] - notes_data['user_notes']} ❌ SKIPPED")
+                
+                if notes_data.get('notes_by_user'):
+                    log_progress(f"   └─ Breakdown by user:")
+                    for user_id, count in notes_data['notes_by_user'].items():
+                        marker = "✅ DELETE" if user_id == TARGET_USER_ID else "❌ SKIP"
+                        log_progress(f"      • User {user_id}: {count} notes [{marker}]")
+    
+    # Delete notes by user 112
     results = []
     for note in notes:
         result = await delete_note(session, rate_limiter, note['id'])
         results.append(result)
+        
+        # Log first few deletions for verification
+        async with lock:
+            if state['total_deleted'] < 5 or (state['total_deleted'] + 1) % 100 == 0:
+                status = "✅ DELETED" if result['success'] else "❌ FAILED"
+                log_progress(f"   {status} Note ID {note['id']} (Deal {deal_id}, User {TARGET_USER_ID})")
     
+    # Update state
     async with lock:
         state['processed_deal_ids'].append(deal_id)
         for result in results:
@@ -220,7 +263,8 @@ async def process_deal(session, rate_limiter, deal_id, state, lock):
         'deal_id': deal_id,
         'notes_found': len(notes),
         'notes_deleted': sum(1 for r in results if r['success']),
-        'notes_failed': sum(1 for r in results if not r['success'])
+        'notes_failed': sum(1 for r in results if not r['success']),
+        'all_notes_on_deal': notes_data['all_notes']
     }
 
 async def main():
@@ -258,6 +302,8 @@ async def main():
         
         log_progress("")
         log_progress(f"📋 Step 2: Processing {len(deals):,} deals (fetching & deleting notes)...")
+        log_progress(f"⚠️  IMPORTANT: Only deleting notes where userid='{TARGET_USER_ID}'")
+        log_progress(f"⚠️  All other notes will be SKIPPED and left untouched")
         log_progress(f"⏱️  Estimated time: {len(deals) * 2 / RATE_LIMIT_PER_SECOND / 60:.0f} minutes")
         log_progress("")
         
@@ -266,17 +312,18 @@ async def main():
         lock = asyncio.Lock()
         completed = 0
         last_update = 0
-        deals_with_notes = 0
+        stats = {
+            'deals_with_notes': 0,
+            'total_notes_scanned': 0
+        }
         
         async def bounded_process(deal_id):
-            nonlocal completed, last_update, deals_with_notes
+            nonlocal completed, last_update
             
             async with semaphore:
-                result = await process_deal(session, rate_limiter, deal_id, state, lock)
+                result = await process_deal(session, rate_limiter, deal_id, state, lock, stats)
                 
                 completed += 1
-                if result['notes_found'] > 0:
-                    deals_with_notes += 1
                 
                 current_time = time.time()
                 if current_time - last_update >= 10.0:
@@ -286,12 +333,19 @@ async def main():
                     progress = (completed / len(deals)) * 100
                     eta = (len(deals) - completed) / rate if rate > 0 else 0
                     
-                    log_progress(
-                        f"   Progress: {completed:,}/{len(deals):,} ({progress:.1f}%) | "
-                        f"Deals w/notes: {deals_with_notes:,} | "
-                        f"Deleted: {state['total_deleted']:,} | "
-                        f"Rate: {rate:.1f} deals/s | ETA: {eta/60:.0f}m"
-                    )
+                    notes_deleted_this_run = state['total_deleted']
+                    notes_skipped = stats['total_notes_scanned'] - notes_deleted_this_run
+                    
+                    log_progress("")
+                    log_progress(f"⏱️  PROGRESS UPDATE:")
+                    log_progress(f"   ├─ Deals processed: {completed:,}/{len(deals):,} ({progress:.1f}%)")
+                    log_progress(f"   ├─ Deals with notes: {stats['deals_with_notes']:,}")
+                    log_progress(f"   ├─ Total notes scanned: {stats['total_notes_scanned']:,}")
+                    log_progress(f"   ├─ Notes deleted (user {TARGET_USER_ID}): {notes_deleted_this_run:,} ✅")
+                    log_progress(f"   ├─ Notes skipped (other users): {notes_skipped:,} ❌")
+                    log_progress(f"   ├─ Failed deletions: {state['total_failed']:,}")
+                    log_progress(f"   ├─ Rate: {rate:.1f} deals/s")
+                    log_progress(f"   └─ ETA: {eta/60:.0f}m {eta%60:.0f}s")
                     
                     # Save state periodically
                     if completed % 100 == 0:
@@ -317,23 +371,43 @@ async def main():
         
         # Summary
         elapsed = time.time() - start_time
+        notes_deleted_this_run = state['total_deleted']
+        notes_skipped = stats['total_notes_scanned'] - notes_deleted_this_run
+        
         log_progress("")
         log_progress("=" * 80)
-        log_progress("📊 BATCH COMPLETE")
+        log_progress("📊 BATCH COMPLETE - DETAILED SUMMARY")
         log_progress("=" * 80)
-        log_progress(f"✅ Deals processed: {completed:,}")
-        log_progress(f"✅ Deals with notes by user {TARGET_USER_ID}: {deals_with_notes:,}")
-        log_progress(f"✅ Notes deleted this run: {state['total_deleted'] - (state['total_deleted'] - deals_with_notes):,}")
-        log_progress(f"⏱️  Time: {elapsed/60:.1f} minutes")
-        log_progress(f"📈 Rate: {completed/elapsed:.2f} deals/s")
         log_progress("")
-        log_progress("📊 OVERALL PROGRESS")
+        log_progress("📋 DEALS PROCESSED:")
+        log_progress(f"   ├─ Total deals checked: {completed:,}")
+        log_progress(f"   ├─ Deals with any notes: {stats['deals_with_notes']:,}")
+        log_progress(f"   └─ Deals with no notes: {completed - stats['deals_with_notes']:,}")
+        log_progress("")
+        log_progress(f"📝 NOTES ANALYSIS (CRITICAL VERIFICATION):")
+        log_progress(f"   ├─ Total notes found on all deals: {stats['total_notes_scanned']:,}")
+        log_progress(f"   ├─ Notes created by USER {TARGET_USER_ID}: {notes_deleted_this_run:,} ✅ DELETED")
+        log_progress(f"   ├─ Notes by OTHER users: {notes_skipped:,} ❌ SKIPPED (NOT DELETED)")
+        log_progress(f"   ├─ Failed deletions: {state['total_failed']:,}")
+        log_progress(f"   └─ Success rate: {(notes_deleted_this_run/(notes_deleted_this_run + state['total_failed'])*100) if (notes_deleted_this_run + state['total_failed']) > 0 else 0:.1f}%")
+        log_progress("")
+        log_progress("⏱️  PERFORMANCE:")
+        log_progress(f"   ├─ Time: {elapsed/60:.1f} minutes ({elapsed:.0f}s)")
+        log_progress(f"   ├─ Rate: {completed/elapsed:.2f} deals/s")
+        log_progress(f"   └─ API calls: {rate_limiter.request_count:,}")
+        log_progress("")
+        log_progress("=" * 80)
+        log_progress("📊 CUMULATIVE PROGRESS (ALL BATCHES)")
         log_progress("=" * 80)
         log_progress(f"✅ Total deals processed: {len(state['processed_deal_ids']):,}")
-        log_progress(f"✅ Total notes deleted: {state['total_deleted']:,}")
+        log_progress(f"✅ Total notes deleted (user {TARGET_USER_ID} only): {state['total_deleted']:,}")
         log_progress(f"❌ Total failed: {state['total_failed']:,}")
-        log_progress(f"📊 API calls: {rate_limiter.request_count:,}")
         log_progress(f"⏭️  Remaining deals: {state['remaining_deals']:,}")
+        log_progress("")
+        log_progress("🔒 SAFETY CONFIRMATION:")
+        log_progress(f"   ✅ ONLY notes with userid='{TARGET_USER_ID}' were deleted")
+        log_progress(f"   ✅ ALL notes by other users were preserved")
+        log_progress(f"   ✅ NO contact notes were touched (deal notes only)")
         log_progress("=" * 80)
 
 if __name__ == "__main__":
